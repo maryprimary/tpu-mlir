@@ -21,7 +21,11 @@ void populateTopToTosaConversionPatterns(RewritePatternSet *patterns) {
         MaxPoolLowering,
         SoftmaxLowering,
         ReshapeLowering,
-        MatMulLowering
+        MatMulLowering,
+        ConcatLowering,
+        SiLULowering,
+        UpsampleLowering,
+        PermuteLowering
       // clang-format on
       >(patterns->getContext());
 }
@@ -453,6 +457,179 @@ void MatMulLowering::Lowering(PatternRewriter &rewriter,
   } else {
     rewriter.replaceOp(op, for_relu);
   }
+}
+
+//===------------------------------------------------------------===//
+// ConcatLowering
+//===------------------------------------------------------------===//
+void ConcatLowering::Lowering(PatternRewriter &rewriter,
+                              top::ConcatOp op) const {
+  assert(op->getNumResults() == 1);
+
+  auto preType = op->getResult(0).getType();
+  auto newType = change_dataformat(preType);
+
+  std::vector<Value> operands;
+  for (auto in : op->getOperands()) {
+    operands.push_back(in);
+  }
+
+  auto size = preType.cast<RankedTensorType>().getShape().size();
+  int32_t new_axis, axis = op.getAxis();
+  if (size == 4) {
+    if (axis == 1 || axis == -3)
+      new_axis = 3; // C
+    else if (axis == 2 || axis == -2)
+      new_axis = 1; // H
+    else if (axis == 3 || axis == -1)
+      new_axis = 2; // W
+    else
+      new_axis = axis; // N
+  }
+
+  std::vector<NamedAttribute> attrs;
+  attrs.push_back(
+      rewriter.getNamedAttr("axis", rewriter.getI64IntegerAttr(new_axis)));
+
+  // do_relu
+  if (op.getDoRelu()) {
+    // Concat op
+    auto conc = rewriter.create<mlir::tosa::ConcatOp>(op->getLoc(), newType,
+                                                      operands, attrs);
+    auto relu_limit = op.getReluLimit();
+    std::vector<NamedAttribute> clamp_attr =
+        gen_clamp_attr(rewriter, newType, relu_limit);
+    auto out_type = conc->getResult(0).getType();
+    // Clamp op
+    auto clamp = rewriter.create<mlir::tosa::ClampOp>(
+        op->getLoc(), out_type, conc->getResults(), clamp_attr);
+    rewriter.replaceOp(op, clamp->getResults());
+  } else {
+    rewriter.replaceOpWithNewOp<mlir::tosa::ConcatOp>(op, newType, operands,
+                                                      attrs);
+  }
+}
+
+//===------------------------------------------------------------===//
+// SiLULowering
+//===------------------------------------------------------------===//
+void SiLULowering::Lowering(PatternRewriter &rewriter, top::SiLUOp op) const {
+  assert(op->getNumResults() == 1);
+
+  auto preType = op->getResult(0).getType();
+  auto newType = change_dataformat(preType);
+
+  auto sigm = rewriter.create<mlir::tosa::SigmoidOp>(op->getLoc(), newType,
+                                                     op->getOperand(0));
+  auto out_type = sigm->getResult(0).getType();
+  // mul op
+  std::vector<Value> operands;
+  operands.push_back(op->getOperand(0));
+  operands.push_back(sigm->getResult(0));
+
+  std::vector<NamedAttribute> attrs;
+  attrs.push_back(
+      rewriter.getNamedAttr("shift", rewriter.getI32IntegerAttr(0)));
+
+  auto emul = rewriter.create<mlir::tosa::MulOp>(op->getLoc(), out_type,
+                                                 operands, attrs);
+
+  rewriter.replaceOp(op, emul->getResults());
+}
+
+//===------------------------------------------------------------===//
+// UpsampleLowering
+//===------------------------------------------------------------===//
+void UpsampleLowering::Lowering(PatternRewriter &rewriter,
+                                top::UpsampleOp op) const {
+  assert(op->getNumResults() == 1);
+
+  auto preType = op->getResult(0).getType();
+  auto newType = change_dataformat(preType);
+
+  auto scalh = op.getScaleHAttr().getValue().getSExtValue();
+  auto scalw = op.getScaleWAttr().getValue().getSExtValue();
+
+  std::vector<NamedAttribute> attrs;
+  attrs.push_back(
+      rewriter.getNamedAttr("border", rewriter.getDenseI64ArrayAttr({0, 0})));
+
+  attrs.push_back(rewriter.getNamedAttr(
+      "mode", rewriter.getStringAttr("NEAREST_NEIGHBOR")));
+
+  auto offs = llvm::ArrayRef<int64_t>{0, 0};
+  attrs.push_back(
+      rewriter.getNamedAttr("offset", rewriter.getDenseI64ArrayAttr(offs)));
+
+  attrs.push_back(rewriter.getNamedAttr(
+      "scale", rewriter.getDenseI64ArrayAttr({scalh * 2, 2, scalw * 2, 2})));
+
+  if (op.getDoRelu()) {
+    // Resize op
+    auto resz = rewriter.create<mlir::tosa::ResizeOp>(op->getLoc(), newType,
+                                                      op->getOperands(), attrs);
+    auto relu_limit = op.getReluLimit();
+    std::vector<NamedAttribute> clamp_attr =
+        gen_clamp_attr(rewriter, newType, relu_limit);
+    auto out_type = resz->getResult(0).getType();
+    // Clamp op
+    auto clamp = rewriter.create<mlir::tosa::ClampOp>(
+        op->getLoc(), out_type, resz->getResults(), clamp_attr);
+    rewriter.replaceOp(op, clamp->getResults());
+  } else {
+    rewriter.replaceOpWithNewOp<mlir::tosa::ResizeOp>(op, newType,
+                                                      op->getOperands(), attrs);
+  }
+}
+
+//===------------------------------------------------------------===//
+// PermuteLowering
+//===------------------------------------------------------------===//
+void PermuteLowering::Lowering(PatternRewriter &rewriter,
+                               top::PermuteOp op) const {
+  assert(op->getNumResults() == 1);
+
+  auto preType = op->getResult(0).getType();
+  auto newType = change_dataformat(preType);
+  //
+  auto order_ = *module::getI64Array(op.getOrder());
+  // origin infer to 1 -> tosa infer to 3; ...
+  auto size = order_.size();
+  std::vector<int64_t> order;
+  if (size == 4) {
+    // change dataformat; example: [0 1 3 2] -> [0 3 2 1] -> [0 2 1 3]
+    int from_idx[4] = {0, 2, 3, 1};
+    for (int idx = 0; idx < size; ++idx) {
+      int tmp = order_[from_idx[idx]];
+      if (tmp == 1 || tmp == -3)
+        tmp = 3; // C
+      else if (tmp == 2 || tmp == -2)
+        tmp = 1; // H
+      else if (tmp == 3 || tmp == -1)
+        tmp = 2; // W
+      else
+        tmp = tmp; // N
+      order.push_back(tmp);
+    }
+  } else {
+    for (int idx = 0; idx < size; ++idx) {
+      int tmp = order_[idx];
+      order.push_back(tmp);
+    }
+  }
+
+  auto const_ty = RankedTensorType::get({static_cast<int64_t>(size)},
+                                        rewriter.getI64Type());
+  DenseElementsAttr attr = DenseElementsAttr::get(
+      const_ty, llvm::ArrayRef(order.data(), order.size()));
+  auto constop =
+      rewriter.create<mlir::tosa::ConstOp>(op->getLoc(), const_ty, attr);
+
+  std::vector<Value> operands;
+  operands.push_back(op->getOperand(0));
+  operands.push_back(constop->getResult(0));
+
+  rewriter.replaceOpWithNewOp<mlir::tosa::TransposeOp>(op, newType, operands);
 }
 
 } // namespace tpu_mlir

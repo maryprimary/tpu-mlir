@@ -49,7 +49,7 @@ if __name__ == '__main__':
     #output_size = 1
     #for i in output_shape:
     #    output_size = output_size * eval(i)
-    model_inference_cpu(args.model, eval(output_shape))
+    model_inference_cpu(args.model, str(eval(output_shape)))
 
 
 

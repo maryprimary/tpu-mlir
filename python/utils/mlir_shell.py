@@ -773,13 +773,13 @@ def tosa_to_llvm(tosa_mlir: str, objfile: str):
         "convert-tensor-to-linalg, "
         "func.func(canonicalize, linalg-bufferize, convert-linalg-to-affine-loops, affine-loop-fusion, affine-simplify-structures, lower-affine), "
         "func-bufferize, "
-        "func.func(tensor-bufferize, llvm-request-c-wrappers), "
+        "func.func(empty-tensor-to-alloc-tensor, tensor-bufferize, llvm-request-c-wrappers), "
         "arith-expand, arith-bufferize, normalize-memrefs, convert-scf-to-cf, "
         "convert-math-to-llvm, convert-arith-to-llvm, convert-func-to-llvm, convert-cf-to-llvm, "
         "convert-bufferization-to-memref, memref-expand, expand-strided-metadata, finalize-memref-to-llvm, "
         "canonicalize, llvm-legalize-for-export, reconcile-unrealized-casts)\""
         "| mlir-translate --mlir-to-llvmir "
-        "| llc -mtriple=x86_64-unknown-linux-gnu --filetype=obj")
+        "| llc -mtriple=x86_64-unknown-linux-gnu --relocation-model=pic --filetype=obj")
     cmd.extend([lower_param, "-o", objfile])
     _os_system(cmd)
 

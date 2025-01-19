@@ -15,9 +15,9 @@
                 "${workspaceFolder}/third_party/customlayer/include/kernel"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/gcc",
-            "cStandard": "gnu17",
-            "cppStandard": "gnu++17",
+            "compilerPath": "/usr/bin/clang++",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
             "intelliSenseMode": "linux-gcc-x64",
             "compileCommands": "${workspaceFolder}/build/compile_commands.json"
         }
